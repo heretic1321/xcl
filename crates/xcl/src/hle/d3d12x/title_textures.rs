@@ -41,6 +41,14 @@ extern "system" {
 /// (device, address its bytes are read from, layout, states) of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
+/// Snapshot reported on the `XCL_ACTIVITY` memory line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub active: usize,
+    pub shadowed: usize,
+    pub covered_bytes: usize,
+}
+
 struct Entry {
     device: usize,
     /// the title's address of the texture
@@ -285,6 +293,30 @@ impl Table {
     fn overlapping(&self, va: usize, len: usize) -> Vec<(usize, usize)> {
         self.active_overlaps(va, va.saturating_add(len)).into_iter().take(4).map(|(ova, ores, _)| (ores, ova)).collect()
     }
+
+    fn teardown(&mut self, device: Option<usize>) -> (usize, Vec<usize>) {
+        let mut dropped = 0usize;
+        let mut removed = Vec::new();
+        let active: Vec<usize> = self.by_res.iter().filter(|(_, e)| device.is_none_or(|d| e.device == d)).map(|(&r, _)| r).collect();
+        for res in active {
+            if let Some(old) = self.by_res.remove(&res) {
+                self.by_va.remove(&(old.va, res));
+                if old.pending {
+                    dropped += 1;
+                }
+                removed.push(res);
+            }
+        }
+        let shadowed: Vec<usize> = self.shadowed.iter().filter(|(_, e)| device.is_none_or(|d| e.device == d)).map(|(&r, _)| r).collect();
+        for res in shadowed {
+            if let Some(old) = self.shadowed.remove(&res) {
+                self.shadowed_by_va.remove(&(old.va, res));
+                removed.push(res);
+            }
+        }
+        self.max_shadowed_size = self.shadowed.values().map(|e| e.tex.size() as usize).max().unwrap_or(0);
+        (dropped, removed)
+    }
 }
 
 fn adjust_pending(delta: isize) {
@@ -320,6 +352,13 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// Activity memory counters for `XCL_ACTIVITY`.
+pub fn stats() -> Stats {
+    let t = TEXTURES.lock().unwrap();
+    let covered_bytes = t.by_res.values().map(|e| e.tex.size() as usize).sum();
+    Stats { active: t.by_res.len(), shadowed: t.shadowed.len(), covered_bytes }
 }
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
@@ -513,6 +552,36 @@ pub fn forget(res: usize) {
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Drop title-texture state and internal upload queues for `device` (or all if `None`).
+pub fn teardown(device: Option<usize>) {
+    let (dropped, removed) = {
+        let mut t = TEXTURES.lock().unwrap();
+        let out = t.teardown(device);
+        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        out
+    };
+    if dropped > 0 {
+        PENDING.fetch_sub(dropped, Ordering::Relaxed);
+    }
+    if !removed.is_empty() {
+        let mut content = LAST_CONTENT.lock().unwrap();
+        for r in removed {
+            content.remove(&r);
+        }
+    }
+    match device {
+        Some(d) => {
+            QUEUES.lock().unwrap().remove(&d);
+        }
+        None => {
+            QUEUES.lock().unwrap().clear();
+            LIST_NOTES.lock().unwrap().clear();
+        }
+    }
+    *WATCH_CACHE.lock().unwrap() = None;
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
 }
 
 /// The title-memory address of a texture kept in step with it.
@@ -1994,5 +2063,38 @@ mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn table_teardown_and_stats_are_scoped_by_device() {
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let entry = |device: usize, va: usize, tex: &Arc<xg::Texture>, pending: bool| Entry {
+            device,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        let mut tbl = Table::new();
+        tbl.insert(1, entry(1, 0x10_0000, &tex_16k, true));
+        tbl.insert(2, entry(1, 0x10_0000, &tex_64k, true)); // shadows 1
+        tbl.insert(3, entry(2, 0x20_0000, &tex_16k, false));
+        assert_eq!((tbl.by_res.len(), tbl.shadowed.len()), (2, 1));
+
+        let (dropped1, mut removed1) = tbl.teardown(Some(1));
+        removed1.sort_unstable();
+        assert_eq!((dropped1, removed1), (1, vec![1, 2]));
+        assert_eq!((tbl.by_res.len(), tbl.shadowed.len(), tbl.max_shadowed_size), (1, 0, 0));
+        assert!(tbl.by_res.contains_key(&3));
+
+        assert_eq!(tbl.teardown(None), (0, vec![3]));
+        assert!(tbl.by_res.is_empty() && tbl.by_va.is_empty() && tbl.shadowed.is_empty() && tbl.shadowed_by_va.is_empty());
     }
 }

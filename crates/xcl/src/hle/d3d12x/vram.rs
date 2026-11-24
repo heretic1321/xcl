@@ -620,6 +620,14 @@ fn forget_pages(resource: usize) {
     }
 }
 
+/// Drop a released queue from the mapping-fence wait cache so a reused pointer cannot skip waits.
+pub(super) fn on_queue_release(queue: usize) {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        pages.waited.remove(&queue);
+    }
+}
+
 /// Before GPU work on `queue`: it waits for the pages mapped since its last work on that device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut dev: Option<ID3D12Device> = None;

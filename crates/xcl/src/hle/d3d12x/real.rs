@@ -127,6 +127,10 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// draws that went with a stand-in (drew nothing) because their pipeline was not built
+    /// within `XCL_PSO_WAIT_MS` – lost, not replayed
+    #[serde(default)]
+    pub standin_draws: usize,
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
@@ -394,6 +398,7 @@ pub fn stats() -> D3d12Stats {
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
+        standin_draws: super::pso_async::standin_draws(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
 }
@@ -2084,19 +2089,53 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+type MadeKey = (usize, u64, [u8; 0x38]);
+
+#[derive(Default)]
+struct ResourceAtCache {
+    made: HashMap<MadeKey, usize>,
+}
+
+static MADE: Mutex<Option<ResourceAtCache>> = Mutex::new(None);
+
+impl ResourceAtCache {
+    fn get(&self, key: &MadeKey) -> Option<usize> {
+        self.made.get(key).copied()
+    }
+
+    fn insert(&mut self, key: MadeKey, res: usize) {
+        self.made.insert(key, res);
+    }
+
+    fn teardown_device(&mut self, device: usize) -> Vec<usize> {
+        let keys: Vec<MadeKey> = self.made.keys().filter(|k| k.0 == device).copied().collect();
+        keys.into_iter().filter_map(|k| self.made.remove(&k)).filter(|&r| r != 0).collect()
+    }
+}
+
+unsafe fn teardown_resource_at(device: usize) {
+    let to_drop = MADE.lock().unwrap().as_mut().map_or_else(Vec::new, |c| c.teardown_device(device));
+    for r in to_drop {
+        drop(windows::core::IUnknown::from_raw(r as *mut c_void));
+    }
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
-/// per address and desc – titles make views of the same memory again and again.
-unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+/// per device, address and desc – titles make views of the same memory again and again.
+/// Returns an owned COM reference cloned under `MADE` so the resource outlives any concurrent
+/// device teardown across descriptor creation.
+unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> Option<ID3D12Resource> {
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
-        return std::ptr::null_mut();
+        return None;
     }
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
-        return r as *mut c_void;
+    let key = (this as usize, va, x);
+    if let Some(raw) = MADE.lock().unwrap().get_or_insert_with(ResourceAtCache::default).get(&key) {
+        return (raw != 0)
+            .then(|| ID3D12Resource::from_raw_borrowed(&(raw as *mut c_void)).cloned())
+            .flatten();
     }
     let mut r = std::ptr::null_mut();
     let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
@@ -2107,8 +2146,22 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
-    r
+    let mut g = MADE.lock().unwrap();
+    let c = g.get_or_insert_with(ResourceAtCache::default);
+    if let Some(existing) = c.get(&key) {
+        let out = (existing != 0)
+            .then(|| ID3D12Resource::from_raw_borrowed(&(existing as *mut c_void)).cloned())
+            .flatten();
+        drop(g);
+        if !r.is_null() {
+            drop(windows::core::IUnknown::from_raw(r));
+        }
+        return out;
+    }
+    c.insert(key, r as usize);
+    (!r.is_null())
+        .then(|| ID3D12Resource::from_raw_borrowed(&r).cloned())
+        .flatten()
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
@@ -2126,7 +2179,8 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    let res = resource_at(this, rdesc, va);
+    dev_create_srv_x(this, res.as_ref().map_or(std::ptr::null_mut(), |r| r.as_raw()), &v, cpu);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2144,7 +2198,8 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    let res = resource_at(this, rdesc, va);
+    dev_create_uav_x(this, res.as_ref().map_or(std::ptr::null_mut(), |r| r.as_raw()), std::ptr::null_mut(), &v, cpu);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.
@@ -2383,6 +2438,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     let mut v: Vec<(&'static str, usize)> = vec![("QueryInterface", qi_override as usize)];
     match kind {
         Kind::Device => v.extend_from_slice(&[
+            ("Release", dev_release as usize),
             ("CreateCommandQueue", dev_create_command_queue as usize),
             ("CheckFeatureSupport", dev_check_feature_support as usize),
             ("CreateCommandAllocator", dev_create_command_allocator as usize),
@@ -4848,11 +4904,22 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     n
 }
 
+unsafe extern "system" fn dev_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        teardown_resource_at(this as usize);
+        super::title_textures::teardown(Some(this as usize));
+    }
+    n
+}
+
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::vram::on_queue_release(this as usize);
     }
     n
 }
@@ -5763,5 +5830,26 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_at_tests {
+    use super::*;
+
+    #[test]
+    fn resource_at_cache_scopes_by_device_and_tears_down() {
+        let d = [0u8; 0x38];
+        let mut c = ResourceAtCache::default();
+        c.insert((1, 0x1000, d), 0xA1);
+        c.insert((1, 0x2000, d), 0); // failed lookup stays cached without entering teardown drop list
+        c.insert((2, 0x1000, d), 0xB1);
+        assert_eq!(c.get(&(1, 0x1000, d)), Some(0xA1));
+        assert_eq!(c.get(&(2, 0x1000, d)), Some(0xB1));
+        assert_eq!(c.teardown_device(1), vec![0xA1]);
+        assert!(c.get(&(1, 0x1000, d)).is_none() && c.get(&(1, 0x2000, d)).is_none());
+        assert_eq!(c.get(&(2, 0x1000, d)), Some(0xB1));
+        assert_eq!(c.teardown_device(2), vec![0xB1]);
+        assert!(c.made.is_empty());
     }
 }

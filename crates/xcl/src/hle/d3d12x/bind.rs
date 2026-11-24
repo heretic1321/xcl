@@ -235,7 +235,7 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = super::pso_async::resolve_for_draw(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -406,8 +406,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    // a pipeline still being built in the background is waited for (its stand-in draws
+    // nothing), at most once within a limit: past it the title's thread goes on (`resolve_for_draw`)
+    if !super::real::is_translated_graphics(super::pso_async::resolve_for_draw(pso)) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -415,7 +416,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = super::pso_async::resolve(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -1187,6 +1188,99 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    #[repr(C)]
+    struct OrderList {
+        vt: *const usize,
+        calls: Mutex<Vec<(&'static str, usize)>>,
+    }
+
+    unsafe extern "system" fn order_set_gfx_rs(this: *mut c_void, rs: *mut c_void) {
+        (*(this as *const OrderList)).calls.lock().unwrap().push(("SetGraphicsRootSignature", rs as usize));
+    }
+
+    unsafe extern "system" fn order_execute_indirect(this: *mut c_void, sig: usize, _max: u32, _args: usize, _args_off: u64, _count_buf: usize, _count_off: u64) {
+        (*(this as *const OrderList)).calls.lock().unwrap().push(("ExecuteIndirect", sig));
+    }
+
+    /// An indirect draw with a PC pipeline or a failed build gets the title's graphics root
+    /// signature bound before it, as `graphics_bound` does for direct draws: a draw without one
+    /// is invalid (debug layer) and faults on WARP.
+    #[test]
+    fn execute_indirect_with_a_stand_in_binds_the_titles_root_signature_first() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[30] = order_set_gfx_rs as usize;
+        orig_vt[59] = order_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+        let fake = Box::new(OrderList { vt: unsafe { ext_vt.as_ptr().add(1) }, calls: Mutex::new(Vec::new()) });
+        let list = &*fake as *const OrderList as *mut c_void;
+
+        // a graphics stand-in whose build failed: resolves to itself, not translated
+        let (standin, rs, sig) = (0x7500_0001usize, 0x7500_0010usize, 0x7500_00F0usize);
+        pso_async::submit(standin, false, Box::new(|| 0));
+        assert_eq!(pso_async::resolve_wait(standin), standin);
+        reset(list, 0x7500_0100, standin);
+        unsafe {
+            set_graphics_root_signature(list, rs as *mut c_void);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(*fake.calls.lock().unwrap(), vec![("SetGraphicsRootSignature", rs), ("ExecuteIndirect", sig)]);
+
+        forget(list);
+        let _ = pso_async::released(standin);
+    }
+
+    /// An indirect draw whose graphics build timed out (still pending on a worker) returns
+    /// without waiting another limit and is skipped rather than calling PC `ExecuteIndirect`.
+    #[test]
+    fn execute_indirect_skips_when_a_still_building_graphics_pipeline_times_out() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[30] = order_set_gfx_rs as usize;
+        orig_vt[59] = order_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+        let fake = Box::new(OrderList { vt: unsafe { ext_vt.as_ptr().add(1) }, calls: Mutex::new(Vec::new()) });
+        let list = &*fake as *const OrderList as *mut c_void;
+
+        let (standin, real, rs, sig) = (0x7500_0002usize, 0x7500_0003usize, 0x7500_0020usize, 0x7500_00F1usize);
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        pso_async::submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let _ = go_rx.recv();
+                real
+            }),
+            0,
+        );
+        assert_eq!(
+            pso_async::resolve_within_for_test(standin, Some(std::time::Duration::from_millis(20))),
+            standin,
+            "initial timeout marks the pipeline late"
+        );
+
+        reset(list, 0x7500_0200, standin);
+        let before = counts_snapshot();
+        let t = std::time::Instant::now();
+        unsafe {
+            set_graphics_root_signature(list, rs as *mut c_void);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+        }
+        let elapsed = t.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(500), "execute_indirect waited {elapsed:?}");
+        assert!(fake.calls.lock().unwrap().is_empty(), "timed-out pending stand-in must skip PC ExecuteIndirect");
+        assert!(counts_snapshot()[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+
+        let _ = go_tx.send(());
+        let _ = pso_async::resolve_wait(standin);
+        forget(list);
+        let _ = pso_async::released(standin);
     }
 
     #[test]
